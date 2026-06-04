@@ -1,0 +1,10 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+.monarch_session/
+*.session
+debug/
+export/
+*.csv
