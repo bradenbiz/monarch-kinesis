@@ -73,6 +73,43 @@ def build_csv(account_name: str, rows: list[tuple[dt.date, float]]) -> str:
     return buf.getvalue()
 
 
+@dataclass
+class TxnRecord:
+    date: dt.date
+    merchant: str
+    notes: str
+    amount: float
+
+
+@dataclass
+class SymbolTxns:
+    symbol: str
+    account_name: str
+    records: list[TxnRecord] = field(default_factory=list)
+    note: str = ""
+
+    @property
+    def csv(self) -> str:
+        return build_txn_csv(self.account_name, self.records)
+
+
+def build_txn_csv(account_name: str, records: list[TxnRecord]) -> str:
+    """Monarch transaction-import CSV: `Date,Merchant,Category,Account,Notes,Amount`.
+
+    Uses the csv module so free-text notes/merchants with commas are quoted.
+    """
+    import csv as _csv
+
+    buf = io.StringIO()
+    writer = _csv.writer(buf)
+    writer.writerow(["Date", "Merchant", "Category", "Account", "Notes", "Amount"])
+    for r in records:
+        writer.writerow(
+            [r.date.isoformat(), r.merchant, "", account_name, r.notes, f"{r.amount:.2f}"]
+        )
+    return buf.getvalue()
+
+
 def _daily_price_for_symbol(
     client: KinesisClient,
     config: Config,
@@ -212,6 +249,114 @@ def build_symbol_result(
         history_rows=rows,
         note=note,
     )
+
+
+def _txn_notes(txn: history.LedgerTxn, usd_amount: float) -> str:
+    """Human-readable context for a transaction: units, implied price, fee, id."""
+    parts: list[str] = []
+    units = txn.token_delta if txn.token_delta is not None else txn.amount
+    if units is not None:
+        parts.append(f"{abs(units):g} {txn.symbol}")
+        # Implied unit price from the resolved USD value — always consistent with
+        # the Amount column (avoids showing a fallback price that didn't apply).
+        if units:
+            parts.append(f"@ ${abs(usd_amount / units):,.2f}")
+    if txn.fee:
+        parts.append(f"fee {txn.fee:g} {txn.symbol}")
+    if txn.txn_id:
+        parts.append(f"txn {txn.txn_id}")
+    return " · ".join(parts)
+
+
+def _card_notes(txn: history.LedgerTxn, usd_amount: float, card: history.LedgerTxn) -> str:
+    """Notes for a card-funded metal sell: spend chain, exact charge, card id.
+
+    The merchant name isn't in the balance-statement API — only the card's
+    Transaction_ID is — so it's included for cross-reference in the Kinesis app.
+    """
+    parts = [f"card spend · sold {_txn_notes(txn, usd_amount)}"]
+    if card.amount is not None:
+        parts.append(f"${card.amount:,.2f} charged")
+    if card.txn_id:
+        parts.append(f"card {card.txn_id}")
+    return " · ".join(parts)
+
+
+def build_symbol_txns(
+    client: KinesisClient,
+    config: Config,
+    symbol: str,
+    txns: list[history.LedgerTxn],
+) -> SymbolTxns:
+    """Build a USD transaction feed for one symbol from the ledger entries."""
+    symbol = symbol.upper()
+    name = assets.account_name(symbol)
+    rows = sorted((t for t in txns if t.symbol == symbol), key=lambda t: t.date)
+    if not rows:
+        return SymbolTxns(symbol=symbol, account_name=name, note="no transactions found")
+
+    # Daily price spanning the transactions, for rows without their own price
+    # (distributions, metal deposits/withdrawals). USD-pegged symbols are 1:1.
+    start, end = rows[0].date, rows[-1].date
+    daily_price: dict[dt.date, float] = {}
+    note = ""
+    try:
+        daily_price = _daily_price_for_symbol(client, config, symbol, start, end)
+    except KinesisError as exc:
+        note = f"price lookup failed ({exc}); price-derived rows skipped"
+
+    # Card spends are booked as a metal sell here + a Card Payment debit on the
+    # C1USD ledger; link them so card-funded sells read as purchases, not trades.
+    card_index = history.card_spend_index(txns)
+
+    records: list[TxnRecord] = []
+    skipped = 0
+    card_spends = 0
+    for t in rows:
+        amount = history.txn_usd_amount(t, daily_price.get(t.date))
+        if amount is None:
+            skipped += 1
+            continue
+        card = history.card_funder_for(t, card_index)
+        if card is not None:
+            card_spends += 1
+            merchant = "Kinesis Card Payment"
+            notes = _card_notes(t, amount, card)
+        else:
+            merchant = f"Kinesis {history.humanize_txn_type(t.txn_type)}"
+            notes = _txn_notes(t, amount)
+        records.append(TxnRecord(date=t.date, merchant=merchant, notes=notes, amount=amount))
+    if card_spends:
+        note = (note + "; " if note else "") + f"{card_spends} card spend(s) labeled"
+    if skipped:
+        note = (note + "; " if note else "") + f"{skipped} row(s) skipped (no USD value derivable)"
+    return SymbolTxns(symbol=symbol, account_name=name, records=records, note=note)
+
+
+def gather_transactions(
+    config: Config,
+    requested_symbols: Optional[list[str]] = None,
+    include_all: bool = False,
+) -> list[SymbolTxns]:
+    """Read Kinesis and build per-symbol USD transaction feeds (no Monarch writes)."""
+    client = KinesisClient(
+        config.kinesis_public_key, config.kinesis_private_key, config.kinesis_base_url
+    )
+    holdings = assets.parse_holdings(client.get_holdings())
+    statement = client.get_balance_statement(
+        params={
+            "fromDate": _iso(FULL_HISTORY_START),
+            "toDate": _iso(today_utc(), end_of_day=True),
+        }
+    )
+    events = history.normalize_statement(statement)
+    txns = history.normalize_transactions(statement)
+
+    if requested_symbols is None and config.symbols:
+        requested_symbols = config.symbols
+
+    symbols = resolve_symbols(requested_symbols, holdings, events, include_all)
+    return [build_symbol_txns(client, config, sym, txns) for sym in symbols]
 
 
 def resolve_symbols(

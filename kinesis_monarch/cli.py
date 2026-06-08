@@ -181,6 +181,39 @@ def cmd_preview(config: Config, args) -> int:
     return 0
 
 
+def cmd_transactions(config: Config, args) -> int:
+    """Build per-symbol USD transaction CSVs locally; no Monarch login."""
+    results = connector.gather_transactions(config, _parse_symbols(args.symbols), args.all)
+    print("Built transaction feeds (no Monarch login):")
+    written = []
+    for r in results:
+        print(f"  {r.account_name}: {len(r.records)} transactions")
+        if r.note:
+            print(f"    note: {r.note}")
+        if not r.records:
+            continue
+        path = os.path.join(args.out, f"{r.symbol}_transactions.csv")
+        os.makedirs(args.out, exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write(r.csv)
+        written.append((r.account_name, path))
+        print(f"    wrote {path}")
+
+    if not written:
+        print("\nNo transactions to write.")
+        return 0
+
+    print("\nNext — import into Monarch yourself (password-free, one-time):")
+    print("  In Monarch, open each manual account and use \"Upload transactions\"")
+    print("  (Settings ▸ ... ▸ Upload transactions) with the matching CSV:")
+    for name, path in written:
+        print(f"       - {path}   ->  {name}")
+    print("\n  Note: amounts are USD value (positive = holding increased). For a")
+    print("  manual account Monarch does NOT reconcile these against the balance-")
+    print("  history chart — the transaction feed is informational/additive.")
+    return 0
+
+
 async def _write_to_monarch(config: Config, results, upload_history: bool) -> None:
     mm = await monarch_sync.login(config)
     print("Logged in to Monarch.")
@@ -284,6 +317,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("preview", help="Build value series + CSVs locally; no Monarch login.")
     add_common(sp, out_default="export")
     sp.set_defaults(func=cmd_preview)
+
+    sp = sub.add_parser("transactions", help="Build per-symbol USD transaction CSVs locally; no Monarch login.")
+    add_common(sp, out_default="export")
+    sp.set_defaults(func=cmd_transactions)
 
     sp = sub.add_parser("backfill", help="Create accounts + upload full history to Monarch.")
     add_common(sp)

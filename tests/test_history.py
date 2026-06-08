@@ -309,3 +309,169 @@ def test_no_history_no_overall_start_sets_current_only():
     assert res.history_rows == []
     # Falls back to live mid-price for current value: 50 * 99.0
     assert res.current_value == 4950.0
+
+
+# ---- transaction feed ------------------------------------------------------
+
+
+def test_normalize_transactions_real_shapes():
+    statement = [
+        {
+            "DateTime": "2022-10-14 17:09:23 UTC",
+            "Currency_Code": "KAG",
+            "Transaction_Type": "Trade",
+            "Transaction_ID": "566970",
+            "Amount": 2.71436523,
+            "Trade_Price": 18.38,
+            "Total": 2.71436,
+            "Fee": 0.00599,
+            "Starting_Balance": "0.00000",
+            "Closing_Balance": "2.71436",
+        },
+        {
+            "DateTime": "2022-12-07 18:06:53 UTC",
+            "Currency_Code": "KVT",
+            "Transaction_Type": "Deposit",
+            "Amount": 2,
+            "Total": "3799.99",
+            "Starting_Balance": "0.0000000",
+            "Closing_Balance": "2.0000000",
+        },
+    ]
+    txns = history.normalize_transactions(statement)
+    assert [t.symbol for t in txns] == ["KAG", "KVT"]
+    trade = txns[0]
+    assert trade.txn_type == "Trade"
+    assert trade.trade_price == 18.38
+    assert round(trade.token_delta, 5) == 2.71436
+    assert txns[1].total == 3799.99
+
+
+def test_txn_usd_amount_trade_uses_trade_price():
+    t = history.LedgerTxn(
+        date=D(2022, 10, 14), symbol="KAG", txn_type="Trade",
+        token_delta=2.71436, amount=2.71436523, trade_price=18.38,
+        total=2.71436, fee=0.00599, txn_id="566970", order_id="", pair="KAG_USD",
+    )
+    # Trade price wins over the (token-denominated) Total field; sign positive.
+    assert history.txn_usd_amount(t, daily_price=25.0) == round(2.71436 * 18.38, 2)
+
+
+def test_txn_usd_amount_deposit_uses_total_and_sign():
+    deposit = history.LedgerTxn(
+        date=D(2022, 12, 7), symbol="KVT", txn_type="Deposit",
+        token_delta=2.0, amount=2.0, trade_price=None, total=3799.99,
+        fee=None, txn_id="", order_id="", pair="",
+    )
+    assert history.txn_usd_amount(deposit, None) == 3799.99
+    withdrawal = history.LedgerTxn(
+        date=D(2023, 1, 1), symbol="KAG", txn_type="Withdrawal",
+        token_delta=-0.25113, amount=0.25, trade_price=None, total=None,
+        fee=0.00113, txn_id="", order_id="", pair="",
+    )
+    # No trade price / total -> token magnitude x daily price, negative (outflow).
+    assert history.txn_usd_amount(withdrawal, daily_price=25.0) == round(-0.25113 * 25.0, 2)
+
+
+def test_txn_usd_amount_unpriceable_returns_none():
+    t = history.LedgerTxn(
+        date=D(2023, 1, 1), symbol="KVT", txn_type="Withdrawal",
+        token_delta=-1.0, amount=1.0, trade_price=None, total=None,
+        fee=None, txn_id="", order_id="", pair="",
+    )
+    assert history.txn_usd_amount(t, daily_price=None) is None
+
+
+def test_humanize_txn_type():
+    assert history.humanize_txn_type("Holder's_Distribution") == "Holder's Distribution"
+    assert history.humanize_txn_type("") == "Activity"
+
+
+def test_build_txn_csv_quotes_and_headers():
+    records = [
+        connector.TxnRecord(
+            date=D(2022, 10, 14), merchant="Kinesis Trade",
+            notes="2.71436 KAG · @ $18.38", amount=49.89,
+        ),
+    ]
+    csv = connector.build_txn_csv("Kinesis Silver (KAG)", records)
+    lines = csv.strip().splitlines()
+    assert lines[0] == "Date,Merchant,Category,Account,Notes,Amount"
+    # Note contains a comma-free separator but the account/notes round-trip cleanly.
+    assert "2022-10-14" in lines[1]
+    assert "Kinesis Silver (KAG)" in lines[1]
+    assert lines[1].endswith("49.89")
+
+
+# ---- card-spend correlation ------------------------------------------------
+
+
+def _txn(**kw):
+    base = dict(
+        date=D(2026, 6, 2), symbol="KAU", txn_type="Trade", token_delta=None,
+        amount=None, trade_price=None, total=None, fee=None, txn_id="",
+        order_id="", pair="", raw_datetime="",
+    )
+    base.update(kw)
+    return history.LedgerTxn(**base)
+
+
+def _card_statement():
+    # The 3-row shape Kinesis books for one $42.99 card purchase.
+    ts = "2026-06-02 13:05:43 UTC"
+    return [
+        {"DateTime": ts, "Currency_Code": "KAU", "Transaction_Type": "Trade",
+         "Currency_Pair": "KAU_C1USD", "Amount": 0.2965730265, "Trade_Price": 145.2754724,
+         "Starting_Balance": "106.26526", "Closing_Balance": "105.96868", "Transaction_ID": "2311716"},
+        {"DateTime": ts, "Currency_Code": "C1USD", "Transaction_Type": "Trade",
+         "Currency_Pair": "KAU_C1USD", "Amount": 42.99, "Trade_Price": 145.2754724,
+         "Starting_Balance": "277.77366", "Closing_Balance": "320.76366", "Transaction_ID": "2311716"},
+        {"DateTime": ts, "Currency_Code": "C1USD", "Transaction_Type": "Withdrawal(Card Payment)",
+         "Amount": 42.99, "Starting_Balance": "320.76366", "Closing_Balance": "277.77366",
+         "Transaction_ID": "VCP419"},
+    ]
+
+
+def test_card_spend_index_and_funder_match():
+    txns = history.normalize_transactions(_card_statement())
+    index = history.card_spend_index(txns)
+    assert list(index) == ["2026-06-02 13:05:43 UTC"]
+    assert index["2026-06-02 13:05:43 UTC"].txn_id == "VCP419"
+
+    kau_sell = next(t for t in txns if t.symbol == "KAU")
+    card = history.card_funder_for(kau_sell, index)
+    assert card is not None and card.txn_id == "VCP419"
+
+    # The C1USD buy leg is an inflow on the same timestamp -> NOT a funder.
+    c1_buy = next(t for t in txns if t.symbol == "C1USD" and t.txn_type == "Trade")
+    assert history.card_funder_for(c1_buy, index) is None
+
+
+def test_card_funder_rejects_amount_mismatch_and_non_usd():
+    index = {"T": _txn(txn_type="Withdrawal(Card Payment)", amount=42.99, raw_datetime="T")}
+    # Same timestamp + sell, but USD value way off the card charge -> rejected.
+    far = _txn(token_delta=-5.0, trade_price=145.0, pair="KAU_C1USD", raw_datetime="T")
+    assert history.card_funder_for(far, index) is None
+    # A non-USD-quoted sell at the same timestamp -> rejected.
+    non_usd = _txn(token_delta=-0.29657, trade_price=145.2754724, pair="KAU_KAG", raw_datetime="T")
+    assert history.card_funder_for(non_usd, index) is None
+    # The genuine funder -> matched.
+    good = _txn(token_delta=-0.29657, trade_price=145.2754724, pair="KAU_C1USD", raw_datetime="T")
+    assert history.card_funder_for(good, index) is not None
+
+
+def test_build_symbol_txns_relabels_card_spend():
+    from types import SimpleNamespace
+
+    cfg = SimpleNamespace(kinesis_quote="C1USD", ohlc_timeframe="1440")
+    txns = history.normalize_transactions(_card_statement())
+    # KAU sell needs a price for the day; provide a flat candle.
+    client = _FakeClient([["2026-06-02T00:00:00.000Z", "145", "145", "145", "145"]])
+    res = connector.build_symbol_txns(client, cfg, "KAU", txns)
+    assert len(res.records) == 1
+    rec = res.records[0]
+    assert rec.merchant == "Kinesis Card Payment"
+    assert rec.amount < 0  # outflow from the gold account
+    assert "card VCP419" in rec.notes
+    assert "42.99 charged" in rec.notes
+    assert "1 card spend(s) labeled" in res.note

@@ -27,6 +27,16 @@ _DELTA_FIELDS = ("amount", "change", "quantity", "qty", "value", "delta")
 _CLOSE_FIELDS = ("close", "c", "closePrice", "price")
 _LIST_KEYS = ("data", "statements", "statement", "entries", "rows", "items", "results", "transactions")
 
+# Extra fields used to reconstruct individual transactions (not just balances).
+_TYPE_FIELDS = ("Transaction_Type", "transactionType", "type", "Type")
+_START_FIELDS = ("Starting_Balance", "startingBalance", "Opening_Balance", "opening")
+_TRADE_PRICE_FIELDS = ("Trade_Price", "tradePrice", "executionPrice")
+_TOTAL_FIELDS = ("Total", "total")
+_FEE_FIELDS = ("Fee", "fee")
+_TXN_ID_FIELDS = ("Transaction_ID", "transactionId", "id", "txid")
+_ORDER_ID_FIELDS = ("Order_ID", "orderId")
+_PAIR_FIELDS = ("Currency_Pair", "currencyPair", "pair")
+
 
 @dataclass(frozen=True)
 class BalanceEvent:
@@ -34,6 +44,29 @@ class BalanceEvent:
     symbol: str
     running_balance: Optional[float]
     delta: Optional[float]
+
+
+@dataclass(frozen=True)
+class LedgerTxn:
+    """One transaction-ledger entry, retaining the fields a transaction needs.
+
+    `token_delta` is the signed change in the asset's units (closing - starting),
+    which gives both magnitude and direction; `amount` is Kinesis's unsigned
+    magnitude field, used only as a fallback when balances are missing.
+    """
+
+    date: dt.date
+    symbol: str
+    txn_type: str
+    token_delta: Optional[float]
+    amount: Optional[float]
+    trade_price: Optional[float]
+    total: Optional[float]
+    fee: Optional[float]
+    txn_id: str
+    order_id: str
+    pair: str
+    raw_datetime: str = ""  # original DateTime string, for sub-day correlation
 
 
 # ---- primitive coercion ----------------------------------------------------
@@ -151,6 +184,127 @@ def normalize_statement(statement: Any) -> list[BalanceEvent]:
 
 def symbols_in(events: Iterable[BalanceEvent]) -> list[str]:
     return sorted({e.symbol for e in events})
+
+
+# ---- statement -> individual transactions ----------------------------------
+
+
+def normalize_transactions(statement: Any) -> list[LedgerTxn]:
+    """Tolerantly convert a balance-statement payload into LedgerTxns.
+
+    Mirrors normalize_statement but keeps the richer per-row fields (type, trade
+    price, USD total, fee, ids) needed to emit a transaction feed rather than a
+    daily balance series.
+    """
+    txns: list[LedgerTxn] = []
+    for entry, symbol_hint in _iter_entries(statement):
+        if not isinstance(entry, dict):
+            continue
+        raw_dt = _first(entry, _DATE_FIELDS)
+        date = parse_date(raw_dt)
+        symbol = _first(entry, _SYMBOL_FIELDS) or symbol_hint
+        if date is None or not symbol:
+            continue
+        closing = _to_float(_first(entry, _BALANCE_FIELDS))
+        starting = _to_float(_first(entry, _START_FIELDS))
+        token_delta = closing - starting if closing is not None and starting is not None else None
+        txns.append(
+            LedgerTxn(
+                date=date,
+                symbol=str(symbol).upper(),
+                txn_type=str(_first(entry, _TYPE_FIELDS) or "").strip(),
+                token_delta=token_delta,
+                amount=_to_float(_first(entry, _DELTA_FIELDS + ("Amount",))),
+                trade_price=_to_float(_first(entry, _TRADE_PRICE_FIELDS)),
+                total=_to_float(_first(entry, _TOTAL_FIELDS)),
+                fee=_to_float(_first(entry, _FEE_FIELDS)),
+                txn_id=str(_first(entry, _TXN_ID_FIELDS) or ""),
+                order_id=str(_first(entry, _ORDER_ID_FIELDS) or ""),
+                pair=str(_first(entry, _PAIR_FIELDS) or ""),
+                raw_datetime=str(raw_dt or ""),
+            )
+        )
+    return txns
+
+
+# ---- card-spend correlation ------------------------------------------------
+#
+# A Kinesis card payment is booked as three ledger rows at the SAME timestamp: a
+# metal sell (e.g. KAU_C1USD, in the metal account), the matching C1USD buy, and
+# a `Withdrawal(Card Payment)` debit (C1USD account) that carries the card's
+# Transaction_ID. The merchant name lives only in the card app, not this API, so
+# we link the metal sell to its card row to at least flag it and attach the id.
+
+
+def is_card_payment(txn: "LedgerTxn") -> bool:
+    return "card" in txn.txn_type.lower()
+
+
+def card_spend_index(txns: Iterable["LedgerTxn"]) -> dict[str, "LedgerTxn"]:
+    """Map each card-payment row's raw timestamp -> the card LedgerTxn."""
+    return {t.raw_datetime: t for t in txns if is_card_payment(t) and t.raw_datetime}
+
+
+def card_funder_for(
+    txn: "LedgerTxn", card_index: dict[str, "LedgerTxn"], tol: float = 0.03
+) -> Optional["LedgerTxn"]:
+    """If `txn` is the metal sell that funded a card payment, return that card row.
+
+    Match = a sell-side Trade on a USD-quoted pair whose timestamp equals a card
+    payment's, and whose USD value is within `tol` of the card's charge (guards
+    against a coincidental same-second trade). Returns None otherwise.
+    """
+    if txn.txn_type.lower() != "trade" or "USD" not in txn.pair.upper():
+        return None
+    if txn.token_delta is None or txn.token_delta >= 0:  # must be an outflow (sell)
+        return None
+    card = card_index.get(txn.raw_datetime)
+    if card is None or card.amount is None:
+        return None
+    magnitude = abs(txn.token_delta)
+    implied_usd = magnitude * txn.trade_price if txn.trade_price else None
+    if implied_usd is None:
+        return card  # no price to cross-check; timestamp match alone
+    if abs(implied_usd - card.amount) <= max(0.5, tol * card.amount):
+        return card
+    return None
+
+
+def humanize_txn_type(txn_type: str) -> str:
+    """'Holder's_Distribution' -> 'Holder's Distribution'; blank -> 'Activity'."""
+    pretty = (txn_type or "").replace("_", " ").strip()
+    return pretty or "Activity"
+
+
+def txn_usd_amount(txn: LedgerTxn, daily_price: Optional[float]) -> Optional[float]:
+    """Signed USD value of one transaction, positive when the holding increased.
+
+    USD magnitude is resolved in priority order: a trade's own execution price,
+    then the row's USD `Total` (e.g. KVT deposits carry it), then the token
+    magnitude x that day's price. Returns None when no USD value can be derived.
+    """
+    magnitude = (
+        abs(txn.token_delta)
+        if txn.token_delta is not None
+        else (abs(txn.amount) if txn.amount is not None else None)
+    )
+    # Direction: balance up = money in (+), balance down = out (-).
+    if txn.token_delta is not None and txn.token_delta != 0:
+        sign = 1.0 if txn.token_delta > 0 else -1.0
+    else:
+        sign = 1.0
+
+    usd: Optional[float] = None
+    if txn.txn_type.lower() == "trade" and txn.trade_price and magnitude is not None:
+        usd = magnitude * txn.trade_price
+    elif txn.total is not None and txn.total != 0:
+        usd = abs(txn.total)
+    elif magnitude is not None and daily_price is not None:
+        usd = magnitude * daily_price
+
+    if usd is None:
+        return None
+    return round(sign * usd, 2)
 
 
 def daily_balances(

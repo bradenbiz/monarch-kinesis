@@ -94,7 +94,41 @@ import overwrites the date range rather than duplicating).
 | `inspect` | Dump raw Kinesis API responses to `debug/` to verify data shapes. |
 | `probe` | Discover the params for the **full** statement history (already wired in). |
 | `preview` | Build the value series and write CSVs to `export/`. **No Monarch login.** |
+| `transactions` | Build per-symbol **transaction** CSVs (USD) to `export/`. **No Monarch login.** |
 | `backfill` / `update` | Advanced/optional automated push — **blocked by Monarch (429)**, see below. |
+
+### Transactions (individual buys, distributions, deposits)
+
+`preview` charts each asset's **value over time** (balance history). If you also
+want the **individual transactions** — trades, distributions, deposits,
+withdrawals — in Monarch's transaction feed:
+
+```bash
+# Writes export/KAU_transactions.csv, KAG_transactions.csv, KVT_transactions.csv
+.venv/bin/python sync.py transactions --symbols KAU,KAG,KVT
+```
+
+Then in Monarch, open each manual account and use **"Upload transactions"** with
+the matching CSV. Columns are `Date,Merchant,Category,Account,Notes,Amount`.
+
+- **Amounts are USD value** (positive = the holding increased, negative =
+  decreased). Trades use their actual execution price; KVT deposits/withdrawals
+  use the USD figure Kinesis reports; distributions are valued at that day's
+  price. Each row's `Notes` carries the token quantity, implied unit price, fee,
+  and Kinesis transaction id.
+- **Card spends are labeled.** When you pay with the Kinesis card, Kinesis books
+  it as a metal sell (in the KAU/KAG account) + a `Withdrawal(Card Payment)`
+  debit (in the C1USD account). The command links the two by timestamp and
+  relabels the metal sell `Kinesis Card Payment`, with the exact charge and the
+  card's `Transaction_ID` in the notes. (The **merchant name** — e.g. "AMAZON
+  MKTPLACE PMTS" — is **not** exposed by Kinesis's balance-statement API, so it
+  can't be included; use the card `Transaction_ID` to look it up in the Kinesis
+  app.) Card purchases paid straight from a C1USD balance (no metal conversion)
+  only appear in a C1USD export.
+- **Heads-up:** for a *manual* asset account Monarch does **not** reconcile
+  imported transactions against imported balance history. This feed is
+  **informational/additive** — it won't drive the balance-history chart, so keep
+  using `preview` + "Import Balance History" for the chart itself.
 
 ### Options
 
