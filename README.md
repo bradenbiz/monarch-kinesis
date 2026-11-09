@@ -36,9 +36,10 @@ and writes CSV files. You do the import yourself in Monarch's UI.
   **Monarch actively blocks its login with HTTP 429**, and automated access
   violates Monarch's ToS. It's kept only as an optional/advanced path and is
   expected to fail — prefer the UI import.
-- **Kinesis API keys can place trades.** This tool only ever calls **read-only**
-  (`GET`) endpoints and never exposes trade/withdraw calls — but keep your
-  private key secret. Treat the key as read-only by only using it here.
+- **Use a read-only, IP-restricted Kinesis key.** This tool only ever calls
+  **read-only** (`GET`) endpoints and never exposes trade/withdraw calls. The
+  key in use is created read-only and restricted to the machine's IP, so it
+  can't trade even if leaked. It lives in 1Password, not in a plaintext file.
 - Review the [Kinesis API License Agreement](https://kinesis.money/legal-documents/api-license-agreement/)
   (it has clauses about integrating with other software).
 
@@ -46,7 +47,9 @@ and writes CSV files. You do the import yourself in Monarch's UI.
 
 1. **Generate Kinesis API keys** at
    <https://kms.kinesis.money/settings/api-keys>. You get a **publicKey** and a
-   **privateKey** (shown once — copy it). You only need read access.
+   **privateKey** (shown once — copy it). Make the key **read-only** and
+   **IP-restricted** to the machine that runs this tool, then store both values
+   in your 1Password vault.
 
 2. **Install** (Python 3.10+):
 
@@ -55,27 +58,42 @@ and writes CSV files. You do the import yourself in Monarch's UI.
    .venv/bin/pip install -r requirements.txt
    ```
 
-3. **Configure** — copy the example env file and fill it in:
+3. **Configure** — the Kinesis keys come from 1Password at run time via
+   [`op run`](https://developer.1password.com/docs/cli/reference/commands/run/),
+   never from a plaintext file. Keep an env file of `op://` references
+   **outside this repo** (it names your vault and item), for example
+   `~/secrets/monarch-kinesis.env.1password`:
 
    ```bash
-   cp .env.example .env
-   # edit .env: Kinesis publicKey + privateKey. That's all the default flow needs.
+   KINESIS_PUBLIC_KEY=op://<vault>/<item>/<public-key-field>
+   KINESIS_PRIVATE_KEY=op://<vault>/<item>/<private-key-field>
    ```
+
+   Non-secret settings can still go in `.env` (`cp .env.example .env`); leave
+   the `KINESIS_*_KEY` lines out of it. Variables injected by `op run` take
+   precedence over `.env`.
 
    For the default (UI-import) flow you do **not** need any Monarch settings.
    Set `SYMBOLS` to the assets you hold (e.g. `SYMBOLS=KAU,KAG,KVT`).
 
 ## Usage — primary flow (password-free)
 
-All commands: `.venv/bin/python sync.py <command>`
+All commands run under `op run` so the Kinesis keys are injected from
+1Password (use your own env file path):
 
 ```bash
+op run --env-file ~/secrets/monarch-kinesis.env.1password -- .venv/bin/python sync.py <command>
+```
+
+```bash
+ENV=~/secrets/monarch-kinesis.env.1password
+
 # 1. Confirm Kinesis auth works and see your data shapes
-.venv/bin/python sync.py inspect
+op run --env-file "$ENV" -- .venv/bin/python sync.py inspect
 
 # 2. Build the value-over-time CSVs (writes export/KAU.csv, KAG.csv, KVT.csv).
 #    No Monarch login — reads Kinesis, writes files only.
-.venv/bin/python sync.py preview --symbols KAU,KAG,KVT
+op run --env-file "$ENV" -- .venv/bin/python sync.py preview --symbols KAU,KAG,KVT
 
 # 3. Import into Monarch yourself (one-time, in the Monarch web UI):
 #    a. Create a manual asset account per symbol, named to match the CSV's
@@ -105,7 +123,7 @@ withdrawals — in Monarch's transaction feed:
 
 ```bash
 # Writes export/KAU_transactions.csv, KAG_transactions.csv, KVT_transactions.csv
-.venv/bin/python sync.py transactions --symbols KAU,KAG,KVT
+op run --env-file "$ENV" -- .venv/bin/python sync.py transactions --symbols KAU,KAG,KVT
 ```
 
 Then in Monarch, open each manual account and use **"Upload transactions"** with
@@ -175,7 +193,7 @@ CSV) is fully covered by `tests/test_history.py`.
 
 ```
 kinesis_monarch/
-  config.py        env / .env loading
+  config.py        env loading (process env, e.g. from op run, wins over .env)
   kinesis.py       signed read-only Kinesis API client
   assets.py        holdings parsing + account naming
   history.py       tolerant parsers + daily value reconstruction (pure, tested)
